@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "allowJs": true,
+
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    "strict": true,
+
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": false,
+    "allowImportingTsExtensions": false,
+    "noEmit": false,
+
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "paths": {
+      "@ai/*": ["./src/ai/*"]
+    }
+  },
+  "include": ["src"]
+}
