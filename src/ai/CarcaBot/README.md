@@ -1,46 +1,406 @@
+# Создано Claude Opus 4.7.
+
+Приведено чисто в качестве примера, как можно использовать utils из `src/engine/utils.ts` и другие сущности из `src/engine` для создания бота.
+Глубокй анализ кода не приводился. Играет очень плохо, надо дорабатывать. Скорее всего ошибки связанны с корреткностью оценкой позиции.
+Разбрасывается миплами, блокирует сам себя и т.д. Плюс нужно извлечь доступное для бота время из состояния игры.
+
+---
+
 # CarcaBot
 
-Bot for the Carcassonne ("Islands") variant on GrandGames Arena.
+Бот для варианта Carcassonne ("Islands") на GrandGames Arena.
 
-## Architecture
+Комбинирует **сильный статический эвалуатор** со **плоским Monte-Carlo
+Tree Search** (flat MCTS без UCT-дерева) поверх короткого списка
+кандидатов. Время задаётся константой `MAX_THINK_TIME` из
+`src/conf.ts` (сейчас `5000 ms`).
 
-The bot is split into four small modules:
+---
 
-- `deck.ts` — tracks the multiset of tiles whose identity is still unknown
-  (deck + hidden hands). Built by subtracting every visible tile from the
-  full 72-tile standard set. Exposes `computeDeck()` and `deckStrength()`.
-- `simulate.ts` — pure function `applyMove(tiles, move, playerIdx)` that
-  places a player's hand tile on the board and sets meeple ownership on
-  the chosen segment. Does not mutate the input.
-- `evaluate.ts` — the static evaluator. Runs `utils.analyzeGameEntities`
-  on the candidate position and scores every meeple-owning structure
-  (road / city / monastery / field). For structures that are not yet
-  closed, the raw scoring value is blended with a completion probability
-  derived from the remaining deck size and the structure complexity
-  (`closeProb` / `monasteryCloseProb`). Adds a meeple-reserve bonus and
-  the already-awarded board points differential.
-- `CarcaBotAI.ts` — the driver. Does an iterative search bounded by
-  `MAX_THINK_TIME`:
-  1. Generate every legal move with `utils.getAllMoves`.
-  2. Score each move via 1-ply lookahead + static evaluation.
-  3. While time is left, refine the top-K candidates with a 1-ply
-     worst-case opponent reply search (sampled, gated on whether the
-     opponent's hand tile is visible).
-  4. Always fall back to the best move found so far if the deadline is
-     hit mid-computation.
+## Содержание
 
-## Design notes
+1. [Быстрый старт](#быстрый-старт)
+2. [Структура модулей](#структура-модулей)
+3. [Алгоритм выбора хода](#алгоритм-выбора-хода)
+4. [Оценка позиции (1-ply эвалуатор)](#оценка-позиции-1-ply-эвалуатор)
+5. [Monte-Carlo rollout'ы](#monte-carlo-rolloutы)
+6. [Конечный подсчёт очков](#конечный-подсчёт-очков-scoreterminal)
+7. [Параметры тюнинга](#параметры-тюнинга)
+8. [Тесты](#тесты)
+9. [Отладка и логи](#отладка-и-логи)
 
-- **Time budget** is `MAX_THINK_TIME - 250 ms` with a floor of 400 ms.
-  Every loop checks `Date.now()` against the deadline.
-- **Branching factor** is huge in Carcassonne (placement × rotation ×
-  meeple segment). Deep alpha-beta is impractical, so we rely on a
-  strong static evaluator and limited 2nd-ply refinement.
-- **Completion probability** is deliberately coarse — a simple function
-  of segment count and deck strength. It captures the qualitative
-  intuition "big structures close less often, closing is a race against
-  an empty deck" without paying the cost of a precise open-edge count.
-- **Tie handling** follows the Carcassonne rule: majority meeple owners
-  all score the full value. Encoded in `delta()` inside `evaluate.ts`.
-- **Meeple reserve** is worth something only while there is still deck
-  to deploy into; the weight decays with `deckStrength`.
+---
+
+## Быстрый старт
+
+```bash
+npm install
+npm run dev          # подключиться к Arena как TestBot
+npm test             # 19 unit/integration тестов через vitest
+npm run typecheck    # tsc --noEmit
+```
+
+Бюджет одного хода: `MAX_THINK_TIME - SAFETY_MARGIN_MS` (по умолчанию
+`5000 - 250 = 4750 ms`) с полом `MIN_BUDGET_MS = 400 ms` на случай,
+если сервер выставит меньший лимит.
+
+---
+
+## Структура модулей
+
+| Файл            | Назначение                                                                                                                                  |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CarcaBotAI.ts` | Driver: генерирует ходы, запускает эвалуатор, MCTS, выбирает лучший ход.                                                                    |
+| `evaluate.ts`   | Статический 1-ply эвалуатор: сумма вкладов road/city/monastery/field + резерв миплов + уже заработанные очки.                               |
+| `terminal.ts`   | Точный подсчёт очков по правилам Carcassonne «как если бы игра закончилась сейчас». Используется как терминальная функция в playout'ах.     |
+| `playout.ts`    | `runPlayout` — случайный forward-simulate с сэмплированием скрытых тайлов.                                                                  |
+| `simulate.ts`   | Pure `applyMove(tiles, mipples, move, playerIdx) → {tiles, mipples, deployed}`. Клонирует массивы, выставляет мипла, декрементирует резерв. |
+| `deck.ts`       | Мультимножество неизвестных тайлов (полный сет 72 минус все видимые).                                                                       |
+| `search.ts`     | `scoreAllMoves(position, myIdx)` — тестовая утилита, повторяющая логику Phase 1.                                                            |
+
+---
+
+## Алгоритм выбора хода
+
+`CarcaBotAI.getBestMove` делает три фазы:
+
+### Phase 1 — 1-ply перебор
+
+```
+for move in utils.getAllMoves(position):
+    simTiles, simMipples = applyMove(position, move, myIdx)
+    score = evaluatePosition(simTiles, ctx)
+    scored.push({move, score})
+scored.sort(score desc)
+```
+
+Дёшево: ~0.5 мс на ход, обычно 30-150 ходов — суммарно 20-80 мс.
+Эта оценка задаёт **приоритет** и служит **pre-filter'ом** для MCTS.
+
+### Phase 2 — Pre-filter
+
+Из `scored` отбираются только кандидаты, удовлетворяющие двум условиям:
+
+- не более `MC_TOP_K = 8` первых,
+- не ниже лидера больше чем на `MC_PREFILTER_GAP = 6` очков.
+
+Это убирает «совсем плохие» ходы до того, как тратить на них
+rollout-бюджет. 1-ply эвалуатор уже отделяет катастрофы (например,
+бесплатно отдать сопернику большой город) от разумных ходов.
+
+### Phase 3 — Flat Monte-Carlo
+
+```
+while Date.now() < deadline:
+    for cand in shortlist:
+        result = runPlayout(position, cand.move, myIdx, deck, MC_HORIZON_PLIES)
+        cand.mcMean = incremental_mean(cand.mcMean, result, cand.mcRuns)
+        cand.mcRuns++
+```
+
+Round-robin: каждому кандидату по одному playout'у за цикл. Это проще
+чем UCB1 и гарантирует равное внимание. После истечения бюджета
+финальная оценка:
+
+```
+final_score = (1 - MC_SCORE_BLEND) * score_1ply + MC_SCORE_BLEND * mcMean
+```
+
+где `MC_SCORE_BLEND = 0.7`. 1-ply оценка всё равно удерживает вес
+`0.3`, чтобы защитить от шума при малом числе rollout'ов.
+
+Если бюджета меньше `MC_MIN_BUDGET_MS = 600 ms` или в шорт-листе <2
+кандидатов — MCTS пропускается, бот отдаёт лучший 1-ply.
+
+---
+
+## Оценка позиции (1-ply эвалуатор)
+
+`evaluate.ts:evaluatePosition(tiles, ctx) → number` возвращает
+**дифференциал**: очки бота минус среднее очков соперников. Сумма
+четырёх независимых компонентов.
+
+### 1. Ценность сущностей на доске
+
+Перебираются `entities.roads / cities / monasteries / fields` из
+`utils.analyzeGameEntities`. Каждая сущность вносит вклад через
+`delta(owners, value, myIdx)`:
+
+- если мипл принадлежит мне → `+value`;
+- если сопернику → `-value`;
+- при равенстве миплов оба игрока получают полный `value` (правило
+  ничьей Carcassonne).
+
+#### Road / City
+
+```
+if completed:       expected = полное значение
+elif endgame:       expected = частичное значение (1 pt/tile)
+else:               expected = completedPts·p + incompletePts·(1-p)
+```
+
+`p` — вероятность закрытия, считается через **open-ends**
+(см. ниже). К `expected` добавляется `meepleReturnValue` —
+ожидаемая ценность возврата мипла в резерв.
+
+#### Monastery
+
+- `completedPts = 9` (монастырь + 8 соседей).
+- `currentPts = 1 + surroundingTiles`.
+- `p = monasteryCloseProb(surroundingTiles, deck)` — зависит от того,
+  сколько соседей ещё нужно и насколько полон `deck`.
+
+#### Field
+
+Поле оценивается только через соседние города:
+
+- завершённый смежный город → `+3` очка (гарантированно);
+- открытый смежный город → `3 · cityCloseProb(openEnds) · FIELD_INCOMPLETE_CITY_DISCOUNT`.
+
+`FIELD_INCOMPLETE_CITY_DISCOUNT = 0.4` дисконтирует «вероятные» города,
+потому что:
+
+1. Мипл на поле **не возвращается** до конца игры.
+2. `cityCloseProb` — это «закроется ли когда-нибудь», а нам нужно
+   «закроется ли _до конца колоды_», что строго меньше.
+
+### 2. Open-ends и вероятность закрытия
+
+Вместо оценки по числу сегментов используется **точный подсчёт
+открытых рёбер** структуры:
+
+```ts
+countOpenEnds(segmentLocations, 'roads' | 'cities', tileMap)
+```
+
+Для каждого сегмента смотрим его `sides` из `getTileDef`, поворачиваем
+в world-пространство (`worldSide = (side + rotation) % 4`) и проверяем,
+есть ли сосед в клетке через `neighborPoint`. Рёбра без соседа —
+open-end.
+
+Вероятность закрытия:
+
+```
+roadCloseProb(openEnds)  = max(0.03, 0.8^openEnds)  · deckStrength
+cityCloseProb(openEnds)  = max(0.02, 0.55^openEnds) · deckStrength
+```
+
+Каждый open-end должен быть независимо закрыт совместимым тайлом;
+дороги закрываются чаще (частые road-end тайлы). Всё умножается на
+`deckStrength(deck) = min(1, deck.total / 30)` — чем меньше осталось
+тайлов, тем меньше шанс всё закрыть.
+
+### 3. Резерв миплов (convex scarcity)
+
+Мипл в резерве имеет ценность, убывающую с ростом числа миплов:
+
+```
+MEEPLE_MARGINALS = [2.5, 1.6, 1.2, 1.0, 0.9, 0.9, 0.9, 0.9]
+```
+
+`MEEPLE_MARGINALS[0] = 2.5` — ценность **последнего** мипла,
+`MEEPLE_MARGINALS[6] = 0.9` — избыточного. Это convex, поэтому:
+
+- Потерять последний мипл **очень дорого** (`2.5 · W_MEEPLE` ≈ 17.5 очков).
+- Потерять один из семи — дёшево (`0.9 · W_MEEPLE` ≈ 6.3 очка).
+
+```
+reserveValue(n, deck) = Σ MARGINALS[0..n-1] · W_MEEPLE · deckStrength(deck)
+```
+
+В финальный скор идёт `myReserveV - avgOppReserveV`. На пустой колоде
+(`deck.total = 0`) резерв обнуляется — играем «в полную» на последних
+ходах.
+
+### 4. Точки на табло
+
+`myPoints - avgOppPoints`. Это уже заработанные, «hard» очки.
+
+### 5. Возврат мипла в резерв
+
+```
+meepleReturnValue(reserveAfterMove, deck, p_return) =
+    p_return · marginalMeeple(reserveAfterMove) · W_MEEPLE · deckStrength
+```
+
+Для закрытых структур `p_return = 1` (мипл вернётся точно).
+Для открытых road/city — `p = roadCloseProb / cityCloseProb`.
+Для полей — `p_return = 0` (мипл закрепляется до конца игры).
+
+**Почему это важно.** Мипл на короткой дороге почти сразу вернётся —
+его «цена размещения» почти ноль. Мипл на поле или на огромном замке с
+3 open-ends — почти наверняка потерян. Convex резерв + `p_return`
+вместе делают «лишний мипл на поле» всегда невыгодным, пока в резерве
+ещё есть миплы.
+
+---
+
+## Monte-Carlo rollout'ы
+
+`playout.ts:runPlayout(position, myMove, myIdx, deck, horizonPlies)`.
+
+### Шаги одного playout'а
+
+1. **Клонируем** `deck.distribution` (multiset скрытых тайлов).
+2. `applyMove(position.tiles, myMove, myIdx)` — делаем ход бота
+   (ply 0).
+3. Для `ply` от 1 до `MC_HORIZON_PLIES`:
+   - `turn = (turn + 1) % nPlayers`.
+   - `ensureHand(tiles, turn, dist)` — если у игрока нет видимого
+     тайла в руке, **сэмплируем** тайл из распределения с весом
+     пропорциональным числу копий. Скрытая информация разворачивается
+     в конкретную гипотезу.
+   - `utils.getAllMoves(pos)` → случайный ход (uniform random).
+   - `applyMove` применяет его, обновляя `tiles` и `mipples`.
+4. По истечении горизонта (или когда кончилась колода/легальные ходы)
+   вызываем `scoreTerminal(tiles, myIdx, nPlayers)`.
+
+### Почему именно 10 плайсов
+
+`MC_HORIZON_PLIES = 10` = 5 ходов каждого игрока при двух участниках.
+Достаточно, чтобы:
+
+- Короткие города/дороги успели закрыться (или не закрыться — обе
+  возможности сэмплируются).
+- Поля начали приносить реальные очки через закрытые за это время
+  города.
+- Большинство rollout'ов оставались быстрыми (каждый шаг — один вызов
+  `getAllMoves`, порядка миллисекунд).
+
+Больше — точнее, но дольше. Меньше — теряется значимость полей (они
+почти ничего не «зарабатывают» за 3-4 хода).
+
+### Почему uniform random, а не эвристика
+
+Классический MCTS-постулат: много шумных playout'ов лучше, чем мало
+«умных». Случайная политика требует примерно вдвое больше rollout'ов
+для той же дисперсии, но они в разы дешевле. При 5-секундном бюджете
+баланс на стороне количества.
+
+### Обработка скрытой руки соперника
+
+Каждый playout — отдельная гипотеза про тайлы, которые получат
+игроки в следующие ходы. Сэмплирование **пропорционально частоте в
+мультимножестве**: если в сете дефиниций `CCFF` встречается 3 копии, а
+`RFRR` — 1, и обе неизвестные, `CCFF` будет сэмплироваться в 3 раза
+чаще. Усреднение по многим playout'ам даёт ожидаемую ценность хода по
+всем возможным раскладам.
+
+---
+
+## Конечный подсчёт очков (`scoreTerminal`)
+
+`terminal.ts` реализует **правила Carcassonne для конца игры без
+каких-либо эвристик**. Отличие от `evaluatePosition`:
+
+- Никаких `closeProb` — только то, что реально есть на доске.
+- Резерв миплов ничего не стоит (игра закончилась, миплы не идут
+  никуда).
+- Открытые дороги: `1` очко за тайл.
+- Открытые города: `1` очко за тайл + `1` за каждый щит (вместо `·2`
+  для закрытых).
+- Монастыри: `1 + surroundingTiles` независимо от завершённости.
+- Поля: `3` очка за **каждый закрытый** смежный город (незакрытые
+  игнорируются — основная механика endgame scoring в Carcassonne).
+
+Возвращает `myScore - avgOppScore`. Это и есть терминальное значение
+playout'а.
+
+---
+
+## Параметры тюнинга
+
+Все в `CarcaBotAI.ts`:
+
+| Константа          | Значение | Назначение                                   |
+| ------------------ | -------- | -------------------------------------------- |
+| `SAFETY_MARGIN_MS` | 250      | Запас перед deadline на сериализацию ответа. |
+| `MIN_BUDGET_MS`    | 400      | Пол бюджета даже если `MAX_THINK_TIME` мал.  |
+| `MC_MIN_BUDGET_MS` | 600      | Ниже этого Phase 3 пропускается.             |
+| `MC_HORIZON_PLIES` | 10       | Глубина одного playout'а.                    |
+| `MC_TOP_K`         | 8        | Размер шорт-листа после pre-filter.          |
+| `MC_PREFILTER_GAP` | 6        | Отсечение по разнице 1-ply оценок с лидером. |
+| `MC_SCORE_BLEND`   | 0.7      | Вес MC-среднего в финальной оценке.          |
+
+В `evaluate.ts`:
+
+| Константа                        | Значение                     | Назначение                            |
+| -------------------------------- | ---------------------------- | ------------------------------------- |
+| `W_MEEPLE`                       | 7                            | Базовый вес одного мипла в очках.     |
+| `MEEPLE_MARGINALS`               | [2.5, 1.6, 1.2, 1.0, 0.9, …] | Convex ценность по индексу мипла.     |
+| `MEEPLE_SURPLUS`                 | 0.8                          | Вес миплов за пределами массива.      |
+| `LOCKED_BONUS`                   | 0.1                          | Небольшой буст за вероятное закрытие. |
+| `FIELD_INCOMPLETE_CITY_DISCOUNT` | 0.4                          | Дисконт полей за «может быть» города. |
+
+### Практика тюнинга
+
+- **Медленно работает на реальном сервере** → уменьши
+  `MC_HORIZON_PLIES` до 6-8 или `MC_TOP_K` до 5-6.
+- **Бот слишком робкий с миплами** → подними `W_MEEPLE` вниз до 5-6
+  или уменьши `MEEPLE_MARGINALS[0]`.
+- **Бот слишком агрессивно занимает поля** → увеличь
+  `FIELD_INCOMPLETE_CITY_DISCOUNT` (например, 0.25) или подними
+  `W_MEEPLE`.
+- **Хочется больше полагаться на MC** → `MC_SCORE_BLEND = 0.85-0.9`
+  (только если количество rollout'ов в логах >30 на кандидата).
+
+---
+
+## Тесты
+
+Фреймворк: **vitest** (`vitest.config.ts` настраивает алиасы
+`@ai/*`). Запуск:
+
+```bash
+npm test            # run once
+npm run test:watch  # watch mode
+```
+
+Файлы:
+
+- `evaluate.test.ts` — базовая логика эвалуатора: конвексность резерва,
+  sweeps по всем тайлам из стартовой позиции, проверка что бот
+  **никогда не ставит мипла на поле** в ранней игре.
+- `CarcaBot.integration.test.ts` — `testPos` replay с диагностическим
+  дампом топ-10 ходов, панический анти-commit когда соперник впереди.
+- `mcts.test.ts` — `scoreTerminal`, `runPlayout` на реальных
+  позициях, верификация что за 1 секунду успевают >N rollout'ов.
+
+Всего 19 тестов. Падение любого — регресс в логике.
+
+---
+
+## Отладка и логи
+
+Строка лога CarcaBot:
+
+```
+CarcaBot chose -2,0,1,0 score=4.12 mcRuns=42 mcMean=5.80
+  candidates=8/48 rollouts=336 deck=57 took=4832ms
+```
+
+- `score` — итоговая blended оценка.
+- `mcRuns` / `mcMean` — сколько playout'ов сделано для выбранного
+  хода и их среднее.
+- `candidates=8/48` — шорт-лист / общее число ходов.
+- `rollouts` — сумма playout'ов по всем кандидатам.
+- `took` — реально потраченное время (сравни с `MAX_THINK_TIME`).
+
+### Симптомы и где искать
+
+| Симптом                      | Смотреть                                                            |
+| ---------------------------- | ------------------------------------------------------------------- |
+| `took≪MAX_THINK_TIME`        | MCTS не запускался — проверь `MC_MIN_BUDGET_MS`, размер шорт-листа. |
+| Очень малый `rollouts` (<20) | Playout слишком тяжёлый — уменьши `MC_HORIZON_PLIES`.               |
+| `mcRuns=0` у лучшего         | MC пропущен из-за фильтра — увеличь `MC_PREFILTER_GAP`.             |
+| Странные поля в ранней игре  | `FIELD_INCOMPLETE_CITY_DISCOUNT`, `cityCloseProb`.                  |
+
+### Типичный сценарий изолированной отладки
+
+1. Найти проблемный ход в логе → зафиксировать `testPos`-подобное
+   состояние в тесте.
+2. Вызвать `scoreAllMoves(pos, myIdx)` из `search.ts`, распечатать
+   top-10.
+3. Сравнить с `runPlayout` для тех же ходов → если MC и 1-ply
+   расходятся, смотреть какой из них «дикий».
+4. Добавить регрессионный тест в соответствующий `*.test.ts`.
