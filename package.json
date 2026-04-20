@@ -8,7 +8,9 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "tsx src/test/test.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:legacy": "tsx src/test/test.ts",
     "start:docker": "docker compose --env-file .env.docker up --build --force-recreate -d",
     "typecheck": "tsc --noEmit"
   },
@@ -18,7 +20,8 @@
   "devDependencies": {
     "@types/node": "^25.3.3",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.4"
   },
   "dependencies": {
     "dotenv": "^17.3.1",

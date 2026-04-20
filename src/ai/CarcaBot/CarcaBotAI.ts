@@ -55,23 +55,24 @@ export default class CarcaBotAI extends GameAI {
     const deck = computeDeck(position.tiles)
     const endgame = deck.total <= 2
 
-    const ctx: EvalContext = {
-      myIdx,
-      points: position.points,
-      mipples: position.mipples,
-      deck,
-      endgame,
-    }
-
     // ---------------------------------------------------------------------
-    // Phase 1: score every move with a single-ply lookahead.
+    // Phase 1: score every move with a single-ply lookahead. Each candidate
+    // gets its own EvalContext because the mipples reserve (a core input
+    // of the evaluator) depends on whether this move deployed a meeple.
     // ---------------------------------------------------------------------
     const scored: Scored[] = []
     for (const move of moves) {
       if (Date.now() > deadline) break
       try {
-        const after = applyMove(position.tiles, move, myIdx)
-        const score = evaluatePosition(after, ctx)
+        const sim = applyMove(position.tiles, position.mipples, move, myIdx)
+        const ctx: EvalContext = {
+          myIdx,
+          points: position.points,
+          mipples: sim.mipples,
+          deck,
+          endgame,
+        }
+        const score = evaluatePosition(sim.tiles, ctx)
         scored.push({ move, score })
       } catch (err) {
         log('CarcaBot eval error', err)
@@ -91,7 +92,14 @@ export default class CarcaBotAI extends GameAI {
     // reply would have to enumerate every possible tile draw, which is
     // too expensive for the time we have left).
     // ---------------------------------------------------------------------
-    const refined = this.refineTop(position, scored, ctx, myIdx, deadline)
+    const refined = this.refineTop(
+      position,
+      scored,
+      myIdx,
+      deck,
+      endgame,
+      deadline,
+    )
 
     refined.sort((a, b) => b.score - a.score)
 
@@ -113,8 +121,9 @@ export default class CarcaBotAI extends GameAI {
   private refineTop(
     position: GamePosition,
     scored: Scored[],
-    ctx: EvalContext,
     myIdx: number,
+    deck: ReturnType<typeof computeDeck>,
+    endgame: boolean,
     deadline: number,
   ): Scored[] {
     const remaining = deadline - Date.now()
@@ -134,10 +143,16 @@ export default class CarcaBotAI extends GameAI {
     for (let i = 0; i < topK; i++) {
       if (Date.now() > deadline) break
       const cand = scored[i]!
-      const afterMy = applyMove(position.tiles, cand.move, myIdx)
+      const mySim = applyMove(
+        position.tiles,
+        position.mipples,
+        cand.move,
+        myIdx,
+      )
       const oppPos: GamePosition = {
         ...position,
-        tiles: afterMy,
+        tiles: mySim.tiles,
+        mipples: mySim.mipples,
         currentPlayer: oppIdx,
       }
       const oppMoves = utils.getAllMoves(oppPos)
@@ -148,8 +163,17 @@ export default class CarcaBotAI extends GameAI {
       for (const om of sample) {
         if (Date.now() > deadline) break
         try {
-          const after2 = applyMove(afterMy, om, oppIdx)
-          const s = evaluatePosition(after2, ctx)
+          const oppSim = applyMove(mySim.tiles, mySim.mipples, om, oppIdx)
+          // Evaluate from the BOT's perspective: meeple-scarcity is now
+          // tracked via `oppSim.mipples` which reflects both deployments.
+          const ctx2: EvalContext = {
+            myIdx,
+            points: position.points,
+            mipples: oppSim.mipples,
+            deck,
+            endgame,
+          }
+          const s = evaluatePosition(oppSim.tiles, ctx2)
           if (s < worst) worst = s
         } catch {
           // ignore malformed opp move
@@ -173,7 +197,11 @@ export default class CarcaBotAI extends GameAI {
   ): number | null {
     const seen = new Set<number>()
     for (const t of tiles) {
-      if (typeof t.place === 'number' && t.place !== myIdx && t.index !== null) {
+      if (
+        typeof t.place === 'number' &&
+        t.place !== myIdx &&
+        t.index !== null
+      ) {
         seen.add(t.place)
       }
     }

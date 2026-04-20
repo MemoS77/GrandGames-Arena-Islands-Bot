@@ -25,7 +25,11 @@ export function findHandTile(
 ): { tile: TileState; arrayIndex: number } | null {
   for (let i = 0; i < tiles.length; i++) {
     const t = tiles[i]!
-    if (typeof t.place === 'number' && t.place === playerIdx && t.index !== null) {
+    if (
+      typeof t.place === 'number' &&
+      t.place === playerIdx &&
+      t.index !== null
+    ) {
       return { tile: t, arrayIndex: i }
     }
   }
@@ -33,39 +37,60 @@ export function findHandTile(
 }
 
 /**
+ * Result of simulating a move: the new tile list AND the new per-player
+ * meeple-reserve vector (decremented for the acting player when a meeple
+ * was deployed).
+ */
+export type SimResult = {
+  tiles: TileState[]
+  mipples: number[]
+  deployed: boolean
+}
+
+/**
  * Produce a shallow clone of the tile list where the given player's
  * hand tile has been placed on the board according to `move`. If the
  * move contains a meeple segment, the corresponding `mipples` slot is
- * set to the player index.
+ * set to the player index AND the player's reserve count is decremented
+ * in the returned `mipples` vector.
  *
- * The function is intentionally pure: the original `tiles` array is not
- * mutated, which lets us explore many variations without side effects.
+ * The function is intentionally pure: the original `tiles` and
+ * `reserveMipples` arrays are not mutated — this lets the search
+ * explore many variations without side effects.
  */
 export function applyMove(
   tiles: TileState[],
+  reserveMipples: number[],
   move: AIMove,
   playerIdx: number,
-): TileState[] {
+): SimResult {
   const next: TileState[] = tiles.map((t) => ({ ...t }))
+  const mipples = reserveMipples.slice()
   const hand = findHandTile(next, playerIdx)
-  if (!hand || hand.tile.index === null) return next
+  if (!hand || hand.tile.index === null) {
+    return { tiles: next, mipples, deployed: false }
+  }
 
   const tileDef = utils.getTileDef(hand.tile.index)
   const segCount = getSegmentCount(tileDef)
-  const mipples: (number | null)[] = new Array(segCount).fill(null)
+  const tileMipples: (number | null)[] = new Array(segCount).fill(null)
 
+  let deployed = false
   if (
     move.meepleSegment !== null &&
     move.meepleSegment >= 0 &&
-    move.meepleSegment < segCount
+    move.meepleSegment < segCount &&
+    (mipples[playerIdx] ?? 0) > 0
   ) {
-    mipples[move.meepleSegment] = playerIdx
+    tileMipples[move.meepleSegment] = playerIdx
+    mipples[playerIdx] = (mipples[playerIdx] ?? 0) - 1
+    deployed = true
   }
 
   next[hand.arrayIndex] = {
     index: hand.tile.index,
     place: { point: { ...move.point }, rotation: move.rotation },
-    mipples,
+    mipples: tileMipples,
   }
-  return next
+  return { tiles: next, mipples, deployed }
 }
