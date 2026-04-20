@@ -1,7 +1,7 @@
 import type { GameAI } from './ai/GameAI.js'
 import RandomMoveAI from './ai/RandomMove/RandomMoveAI.js'
 import type { GamePosition } from './ai/types.js'
-import { TOKEN, SERVER } from './conf.js'
+import { TOKEN, SERVER, MAX_TABLES, ALLOW_TRAIN } from './conf.js'
 import log from './log.js'
 import { BotSDK, GameId } from 'gga-bots'
 import { PositionQueue } from './queue.js'
@@ -15,9 +15,19 @@ sdk.onPosition<GamePosition>((p) => {
   queue.handlePosition(p)
 })
 
+console.info('Configuration loaded:', {
+  SERVER,
+  ALLOW_TRAIN,
+  MAX_TABLES,
+})
+
 const connect = () => {
   sdk
-    .connect(TOKEN!, [GameId.Islands], { serverUrl: SERVER })
+    .connect(TOKEN!, [GameId.Islands], {
+      serverUrl: SERVER,
+      maxTables: MAX_TABLES,
+      allowTrain: ALLOW_TRAIN,
+    })
     .then((v) => {
       log('Connected! User info: ', v)
       const ai: GameAI = new RandomMoveAI(sdk)

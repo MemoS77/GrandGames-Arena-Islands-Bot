@@ -1,4 +1,4 @@
-import type { TileState, Point } from './logic/types.js'
+import type { Point, TileState } from './utils/IUtils.js'
 
 export const StateStage = {
   // Player must make a move
