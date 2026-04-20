@@ -1,12 +1,12 @@
 import { testPos } from './testPos.js'
-import RandomMoveAI from '../ai/RandomMove/RandomMoveAI.js'
+import CarcaBotAI from '../ai/CarcaBot/CarcaBotAI.js'
 import type { PositionInfo } from 'gga-bots'
 import type { GamePosition } from '../ai/types.js'
 
 const sdk = {
   botLogin: 'TestBot',
 } as any
-const ai = new RandomMoveAI(sdk)
+const ai = new CarcaBotAI(sdk)
 
 const fullPos: PositionInfo<GamePosition> = {
   position: testPos,

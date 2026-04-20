@@ -1,7 +1,7 @@
 import type { GameAI } from './ai/GameAI.js'
-import RandomMoveAI from './ai/RandomMove/RandomMoveAI.js'
+import { createAI } from './ai/registry.js'
 import type { GamePosition } from './ai/types.js'
-import { TOKEN, SERVER, MAX_TABLES, ALLOW_TRAIN } from './conf.js'
+import { TOKEN, SERVER, MAX_TABLES, ALLOW_TRAIN, AI_NAME } from './conf.js'
 import log from './log.js'
 import { BotSDK, GameId } from 'gga-bots'
 import { PositionQueue } from './queue.js'
@@ -19,6 +19,7 @@ console.info('Configuration loaded:', {
   SERVER,
   ALLOW_TRAIN,
   MAX_TABLES,
+  AI_NAME,
 })
 
 const connect = () => {
@@ -30,7 +31,7 @@ const connect = () => {
     })
     .then((v) => {
       log('Connected! User info: ', v)
-      const ai: GameAI = new RandomMoveAI(sdk)
+      const ai: GameAI = createAI(AI_NAME, sdk)
       ai.init(v.login)
       queue.setAI(ai)
     })
